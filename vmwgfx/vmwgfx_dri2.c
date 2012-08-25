@@ -44,6 +44,10 @@
 #include "wsbm_util.h"
 #include <unistd.h>
 
+#ifdef XORG_WAYLAND
+#include <xwayland.h>
+#endif
+
 #define VMWGFX_FD_PATH_LEN 80
 
 typedef struct {
@@ -368,6 +372,21 @@ dri2_copy_region(DrawablePtr pDraw, RegionPtr pRegion,
     FreeScratchGC(gc);
 }
 
+#ifdef XORG_WAYLAND
+static int dri2_auth_magic2(ScreenPtr pScreen, uint32_t magic)
+{
+    ScrnInfoPtr pScrn = xf86ScreenToScrn(pScreen);
+    modesettingPtr ms = modesettingPTR(pScrn);
+
+    /* Not wayland, go stragight to drm */
+    if (!xorgWayland)
+        return drmAuthMagic(ms->fd, magic);
+
+    /* Forward the request to our host */
+    return xwl_drm_authenticate(ms->xwl_screen, magic);
+}
+#endif
+
 Bool
 xorg_dri2_init(ScreenPtr pScreen)
 {
@@ -386,7 +405,7 @@ xorg_dri2_init(ScreenPtr pScreen)
 	minor = 0;
     }
 
-    dri2info.version = min(DRI2INFOREC_VERSION, 3);
+    dri2info.version = min(DRI2INFOREC_VERSION, 4);
     dri2info.fd = ms->fd;
     dri2info.driverName = "vmwgfx";
 
@@ -413,6 +432,11 @@ xorg_dri2_init(ScreenPtr pScreen)
 
     dri2info.CopyRegion = dri2_copy_region;
     dri2info.Wait = NULL;
+
+#ifdef XORG_WAYLAND
+    dri2info.version = 3;
+    dri2info.AuthMagic2 = dri2_auth_magic2;
+#endif
 
     return DRI2ScreenInit(pScreen, &dri2info);
 }

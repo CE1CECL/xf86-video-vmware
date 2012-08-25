@@ -1208,7 +1208,8 @@ vmwgfx_operation_complete(struct saa_driver *driver,
      * case a flush would deadlock in the kernel.
      */
 
-    if (vpix->hw && vpix->hw_is_dri2_fronts) {
+    if (vpix->hw && (vpix->hw_is_dri2_fronts ||
+		     vpix->hw_is_xwayland)) {
 	if (1 && pScrn->vtSema &&
 	    vmwgfx_upload_to_hw(driver, pixmap, &spix->dirty_shadow)) {
 

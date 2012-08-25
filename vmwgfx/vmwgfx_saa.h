@@ -52,6 +52,7 @@ struct vmwgfx_saa_pixmap {
     struct xa_surface *hw;
     uint32_t fb_id;
     int hw_is_dri2_fronts;
+    int hw_is_xwayland;
     struct _WsbmListHead sync_x_head;
     struct _WsbmListHead scanout_list;
 

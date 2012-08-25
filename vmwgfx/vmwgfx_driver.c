@@ -282,6 +282,41 @@ drv_init_drm(ScrnInfoPtr pScrn)
     return TRUE;
 }
 
+#ifdef XORG_WAYLAND
+static int vmwgfx_create_window_buffer(struct xwl_window *xwl_window,
+				       PixmapPtr pixmap)
+{
+    struct vmwgfx_saa_pixmap *vpix = NULL;
+    struct xa_surface *srf = NULL;
+    uint32_t name, pitch, flags;
+
+    fprintf(stderr, "cwb2: enter\n");
+
+    if (!vmwgfx_hw_dri2_validate(pixmap, 0))
+	return BadDrawable;
+
+    vpix = vmwgfx_saa_pixmap(pixmap);
+    if (vpix == NULL)
+	return BadDrawable;
+
+    vpix->hw_is_xwayland = 1;
+
+    srf = vpix->hw;
+    if (srf == NULL || xa_surface_handle(srf, &name, &pitch) != 0)
+        return BadDrawable;
+
+    fprintf(stderr, "cwb2: %u %u\n", name, pitch);
+
+    return xwl_create_window_buffer_drm(xwl_window, pixmap, name);
+}
+
+static struct xwl_driver xwl_driver = {
+    .version = 1,
+    .use_drm = 1,
+    .create_window_buffer = vmwgfx_create_window_buffer
+};
+#endif
+
 /**
  * vmwgfx_set_topology - Set the GUI topology according to an option string
  *
@@ -374,9 +409,65 @@ drv_pre_init(ScrnInfoPtr pScrn, int flags)
     ms->PciInfo = xf86GetPciInfoForEntity(ms->pEnt->index);
     xf86SetPrimInitDone(pScrn->entityList[0]);
 
-    ms->fd = -1;
-    if (!drv_init_drm(pScrn))
-	goto out_err_bus;
+    /* Need to do this before xwl_screen_pre_init */
+    pScrn->monitor = pScrn->confScreen->monitor;
+    pScrn->progClock = TRUE;
+    pScrn->rgbBits = 8;
+
+    if (!xf86SetDepthBpp
+	(pScrn, 0, 0, 0,
+	 PreferConvert24to32 | SupportConvert24to32 | Support32bppFb)) {
+	xf86DrvMsg(pScrn->scrnIndex, X_ERROR, "Failed to set depth and bpp.\n");
+	goto out_depth;
+    }
+
+    ms->xwl_screen = NULL;
+#ifdef XORG_WAYLAND
+    if (xorgWayland) {
+	fprintf(stderr, "Calling xwl_screen_create()\n");
+	ms->xwl_screen = xwl_screen_create();
+	if (!ms->xwl_screen) {
+	    xfDrvMsg(pScrn->scrnIndex, X_ERROR,
+		     "Failed to initialize xwayland.\n");
+	    goto out_err_bus;
+	}
+
+	fprintf(stderr, "Calling xwl_screen_pre_init()\n");
+	if (!xwl_screen_pre_init(pScrn, ms->xwl_screen,
+				  0, &xwl_driver)) {
+	     xfDrvMsg(pScrn->scrnIndex, X_ERROR,
+		      "Failed to initialize xwayland.\n");
+	     xwl_screen_destroy(ms->xwl_screen);
+	     goto out_err_bus;
+	}
+
+	fprintf(stderr, "Calling xwl_screen_get_fb()\n");
+	ms->fd = xwl_screen_get_drm_fd(ms->xwl_screen);
+	/* XXX check for 3D */
+
+	if (ms->fd >= 0) {
+	    drmVersionPtr ver = drmGetVersion(ms->fd);
+
+	    if (ver == NULL) {
+		xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+			   "Could not determine DRM version.\n");
+		goto out_err_bus;
+	    }
+
+	    ms->drm_major = ver->version_major;
+	    ms->drm_minor = ver->version_minor;
+	    ms->drm_patch = ver->version_patchlevel;
+
+	    drmFreeVersion(ver);
+	}
+    }
+#endif
+
+    if (!ms->xwl_screen) {
+	ms->fd = -1;
+	if (!drv_init_drm(pScrn))
+		goto out_err_bus;
+    }
 
     if (ms->drm_major != DRM_VERSION_MAJOR_REQUIRED ||
 	ms->drm_minor < DRM_VERSION_MINOR_REQUIRED) {
@@ -396,17 +487,6 @@ drv_pre_init(ScrnInfoPtr pScrn, int flags)
     }
 
     ms->check_fb_size = (vmwgfx_max_fb_size(ms->fd, &ms->max_fb_size) == 0);
-
-    pScrn->monitor = pScrn->confScreen->monitor;
-    pScrn->progClock = TRUE;
-    pScrn->rgbBits = 8;
-
-    if (!xf86SetDepthBpp
-	(pScrn, 0, 0, 0,
-	 PreferConvert24to32 | SupportConvert24to32 | Support32bppFb)) {
-	xf86DrvMsg(pScrn->scrnIndex, X_ERROR, "Failed to set depth and bpp.\n");
-	goto out_depth;
-    }
 
     if (vmwgfx_get_param(ms->fd, DRM_VMW_PARAM_HW_CAPS, &cap) != 0) {
 	xf86DrvMsg(pScrn->scrnIndex, X_ERROR, "Failed to detect device "
@@ -522,10 +602,12 @@ drv_pre_init(ScrnInfoPtr pScrn, int flags)
 	xf86DrvMsg(pScrn->scrnIndex, X_ERROR, "Falied parsing or setting "
 		   "gui topology from config file.\n");
 
-    xorg_crtc_init(pScrn);
-    xorg_output_init(pScrn);
+    if (!ms->xwl_screen) {
+        xorg_crtc_init(pScrn);
+        xorg_output_init(pScrn);
+    }
 
-    if (!xf86InitialConfiguration(pScrn, TRUE)) {
+    if (!ms->xwl_screen && !xf86InitialConfiguration(pScrn, TRUE)) {
 	xf86DrvMsg(pScrn->scrnIndex, X_ERROR, "No valid modes.\n");
 	goto out_modes;
     }
@@ -639,9 +721,16 @@ void xorg_flush(ScreenPtr pScreen)
     struct vmwgfx_saa_pixmap *vpix;
     int i;
     xf86CrtcPtr crtc;
-    PixmapPtr *pixmaps = calloc(config->num_crtc, sizeof(*pixmaps));
+    PixmapPtr *pixmaps;
     unsigned int num_scanout = 0;
     unsigned int j;
+
+    if (ms->xwl_screen) {
+	xwl_screen_post_damage(ms->xwl_screen);
+	return;
+    }
+
+    pixmaps = calloc(config->num_crtc, sizeof(*pixmaps));
 
     if (!pixmaps) {
 	LogMessage(X_ERROR, "Failed memory allocation during screen "
@@ -733,7 +822,12 @@ drv_create_screen_resources(ScreenPtr pScreen)
     if (!ret)
 	return ret;
 
-    drv_adjust_frame(ADJUST_FRAME_ARGS(pScrn, pScrn->frameX0, pScrn->frameY0));
+    if (!ms->xwl_screen)
+	drv_adjust_frame(ADJUST_FRAME_ARGS(pScrn, pScrn->frameX0, pScrn->frameY0));
+#ifdef XORG_WAYLAND
+    else
+	xwl_screen_init(ms->xwl_screen, pScreen);
+#endif
 
     return drv_enter_vt(VT_FUNC_ARGS);
 }
@@ -906,7 +1000,7 @@ drv_screen_init(SCREEN_INIT_ARGS_DECL)
     modesettingPtr ms = modesettingPTR(pScrn);
     VisualPtr visual;
 
-    if (!drv_set_master(pScrn))
+    if (!ms->xwl_screen && !drv_set_master(pScrn))
 	return FALSE;
 
     pScrn->pScreen = pScreen;
@@ -1117,7 +1211,7 @@ drv_leave_vt(VT_FUNC_ARGS_DECL)
     vmwgfx_cursor_bypass(ms->fd, 0, 0);
     vmwgfx_disable_scanout(pScrn);
 
-    if (drmDropMaster(ms->fd))
+    if (!ms->xwl_screen && drmDropMaster(ms->fd))
 	xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
 		   "drmDropMaster failed: %s\n", strerror(errno));
 
@@ -1132,11 +1226,12 @@ static Bool
 drv_enter_vt(VT_FUNC_ARGS_DECL)
 {
     SCRN_INFO_PTR(arg);
+    modesettingPtr ms = modesettingPTR(pScrn);
 
-    if (!drv_set_master(pScrn))
+    if (!ms->xwl_screen && !drv_set_master(pScrn))
 	return FALSE;
 
-    if (!xf86SetDesiredModes(pScrn))
+    if (!ms->xwl_screen && !xf86SetDesiredModes(pScrn))
 	return FALSE;
 
     return TRUE;

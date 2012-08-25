@@ -49,6 +49,10 @@
 #include <xf86_libc.h>
 #endif
 
+#ifdef XORG_WAYLAND
+#include "xf86Priv.h"
+#endif
+
 #ifdef HaveDriverFuncs
 #define VMWARE_DRIVER_FUNC HaveDriverFuncs
 #else
@@ -224,6 +228,15 @@ VMwarePreinitStub(ScrnInfoPtr pScrn, int flags)
     xf86DrvMsg(pScrn->scrnIndex, X_INFO,
 	       "Driver was compiled without KMS- and 3D support.\n");
 #endif /* defined(BUILD_VMWGFX) */
+
+#ifdef XORG_WAYLAND
+    if (xorgWayland) {
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                   "Can not fallback to vmwlegacy in XWalyand.\n");
+        return FALSE;
+    }
+#endif
+
     xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
 	       "Disabling 3D support.\n");
     xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
@@ -424,6 +437,11 @@ VMWareDriverFunc(ScrnInfoPtr pScrn,
 
       if (flag) {
          *flag = HW_IO | HW_MMIO;
+
+#ifdef XORG_WAYLAND
+         if (xorgWayland)
+             *flag = HW_SKIP_CONSOLE;
+#endif
       }
       return TRUE;
    case RR_GET_MODE_MM:

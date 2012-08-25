@@ -46,6 +46,11 @@
 #include <xa_tracker.h>
 #include <xf86Module.h>
 
+#ifdef XORG_WAYLAND
+#include <xwayland.h>
+#include "xf86Priv.h"
+#endif
+
 #include "../src/compat-api.h"
 #ifdef DRI2
 #include <dri2.h>
@@ -134,6 +139,12 @@ typedef struct _modesettingRec
 #ifdef DRI2
     Bool dri2_available;
     char dri2_device_name[VMWGFX_DRI_DEVICE_LEN];
+#endif
+
+#ifdef XORG_WAYLAND
+    struct xwl_screen *xwl_screen;
+#else
+    void *xwl_screen;
 #endif
 } modesettingRec, *modesettingPtr;
 
