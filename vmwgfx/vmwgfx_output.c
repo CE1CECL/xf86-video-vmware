@@ -27,20 +27,19 @@
  * Author: Jakob Bornecrantz <wallbraker@gmail.com>
  *
  */
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
 
 #include "xorg-server.h"
-#include <xf86.h>
-#include <xf86i2c.h>
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+#include <xf86str.h>
+#include <xf86RandR12.h>
+#include <randrstr.h>
 #include <xf86Crtc.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <sys/types.h>
+#include <X11/Xatom.h>
+#include <dix.h>
 
 #ifdef HAVE_XEXTPROTO_71
 #include <X11/extensions/dpmsconst.h>
@@ -51,13 +50,43 @@
 
 #include "vmwgfx_driver.h"
 
+/**
+ * struct output_prop - Internal description of an X server output property
+ *
+ * @mode_prop: Corresponding KMS connector property.
+ * @value: Cached value of the property.
+ * @num_atoms: Number of atoms for this property.
+ * @atoms: Array of atoms.
+ * @index: Index into the KMS connector KMS property array for the
+ * corresponding KMS property.
+ */
+struct output_prop {
+    drmModePropertyPtr mode_prop;
+    uint64_t value;
+    int num_atoms;
+    Atom *atoms;
+    int index;
+};
+
+/**
+ * struct output_private - Driver private description of an X server output
+ *
+ * @drm_connector: Pointer to a connector representing the corresponding KMS
+ * connector.
+ * @num_props: Number of struct output_prop in the @props array.
+ * @props: Array of properties for this output.
+ * @is_implicit: Whether this output currently is using implicit placement.
+ * @suggested_x: Shortcut to the suggested X KMS property.
+ * @suggested_y: Shortcut to the suggested Y KMS property.
+ */
 struct output_private
 {
     drmModeConnectorPtr drm_connector;
-
-    int c;
-
+    int num_props;
+    struct output_prop *props;
     Bool is_implicit;
+    struct output_prop *suggested_x;
+    struct output_prop *suggested_y;
 };
 
 static const char *output_enum_list[] = {
@@ -79,11 +108,135 @@ static const char *output_enum_list[] = {
     "Virtual",
 };
 
+/**
+ * output_property_ignore - Whether to hide a KMS property
+ *
+ * @prop: Pointer to a KMS property.
+ *
+ * This function returns TRUE if the property is *not* to be exposed as an
+ * Xserver output property.
+ */
+static Bool
+output_property_ignore(drmModePropertyPtr prop)
+{
+    if (!prop)
+	return TRUE;
+    /* ignore blob prop */
+    if (prop->flags & DRM_MODE_PROP_BLOB)
+	return TRUE;
+    /* ignore standard property */
+    if (!strcmp(prop->name, "EDID") ||
+	!strcmp(prop->name, "DPMS") ||
+	!strcmp(prop->name, "dirty"))
+	return TRUE;
+
+    return FALSE;
+}
+
+
+/**
+ * output_create_resources - post screen creation output initialization
+ *
+ * @output: Output pointer
+ *
+ * This function reads KMS connector property data, initializes internal
+ * data structures and optionally re-exports the property data as
+ * Xserver output properties.
+ */
 static void
 output_create_resources(xf86OutputPtr output)
 {
-#ifdef RANDR_12_INTERFACE
-#endif /* RANDR_12_INTERFACE */
+    modesettingPtr ms = modesettingPTR(output->scrn);
+    struct output_private *vmwgfx_output = output->driver_private;
+    drmModeConnectorPtr drm_connector = vmwgfx_output->drm_connector;
+    drmModePropertyPtr drmmode_prop;
+    struct output_prop *p;
+    int i, j, err;
+
+    vmwgfx_output->props = calloc(drm_connector->count_props,
+				  sizeof(struct output_prop));
+    if (!vmwgfx_output->props)
+	return;
+
+    vmwgfx_output->num_props = 0;
+    p = vmwgfx_output->props;
+    for (i = 0; i < drm_connector->count_props; i++) {
+	drmmode_prop = drmModeGetProperty(ms->fd, drm_connector->props[i]);
+	if (output_property_ignore(drmmode_prop)) {
+	    drmModeFreeProperty(drmmode_prop);
+	    continue;
+	}
+	p->index = i;
+	p->mode_prop = drmmode_prop;
+	p->value = drm_connector->prop_values[i];
+	if (!strcmp(drmmode_prop->name, "suggested X"))
+	    vmwgfx_output->suggested_x = p;
+	else if (!strcmp(drmmode_prop->name, "suggested Y"))
+	    vmwgfx_output->suggested_y = p;
+	vmwgfx_output->num_props++;
+	p++;
+    }
+
+    p = vmwgfx_output->props;
+    for (i = 0; i < vmwgfx_output->num_props; p++, i++) {
+	drmmode_prop = p->mode_prop;
+
+	if (drmmode_prop->flags & DRM_MODE_PROP_RANGE) {
+	    INT32 qrange[2];
+	    INT32 value = p->value;
+
+	    p->num_atoms = 1;
+	    p->atoms = calloc(p->num_atoms, sizeof(Atom));
+	    if (!p->atoms)
+		continue;
+	    p->atoms[0] = MakeAtom(drmmode_prop->name, strlen(drmmode_prop->name), TRUE);
+	    qrange[0] = drmmode_prop->values[0];
+	    qrange[1] = drmmode_prop->values[1];
+
+	    err = RRConfigureOutputProperty(output->randr_output, p->atoms[0],
+		    FALSE, TRUE,
+		    drmmode_prop->flags & DRM_MODE_PROP_IMMUTABLE ? TRUE : FALSE,
+		    2, qrange);
+	    if (err != 0) {
+		xf86DrvMsg(output->scrn->scrnIndex, X_ERROR,
+			"RRConfigureOutputProperty error, %d\n", err);
+	    }
+	    err = RRChangeOutputProperty(output->randr_output, p->atoms[0],
+		    XA_INTEGER, 32, PropModeReplace, 1, &value, FALSE, TRUE);
+	    if (err != 0) {
+		xf86DrvMsg(output->scrn->scrnIndex, X_ERROR,
+			"RRChangeOutputProperty error, %d\n", err);
+	    }
+	} else if (drmmode_prop->flags & DRM_MODE_PROP_ENUM) {
+	    p->num_atoms = drmmode_prop->count_enums + 1;
+	    p->atoms = calloc(p->num_atoms, sizeof(Atom));
+	    if (!p->atoms)
+		continue;
+	    p->atoms[0] = MakeAtom(drmmode_prop->name, strlen(drmmode_prop->name), TRUE);
+	    for (j = 1; j <= drmmode_prop->count_enums; j++) {
+		struct drm_mode_property_enum *e = &drmmode_prop->enums[j-1];
+		p->atoms[j] = MakeAtom(e->name, strlen(e->name), TRUE);
+	    }
+	    err = RRConfigureOutputProperty(output->randr_output, p->atoms[0],
+		    FALSE, FALSE,
+		    drmmode_prop->flags & DRM_MODE_PROP_IMMUTABLE ? TRUE : FALSE,
+		    p->num_atoms - 1, (INT32 *)&p->atoms[1]);
+	    if (err != 0) {
+		xf86DrvMsg(output->scrn->scrnIndex, X_ERROR,
+			"RRConfigureOutputProperty error, %d\n", err);
+	    }
+	    for (j = 0; j < drmmode_prop->count_enums; j++)
+		if (drmmode_prop->enums[j].value == p->value)
+		    break;
+	    /* there's always a matching value */
+	    err = RRChangeOutputProperty(output->randr_output, p->atoms[0],
+		    XA_ATOM, 32, PropModeReplace, 1, &p->atoms[j+1], FALSE, TRUE);
+	    if (err != 0) {
+		xf86DrvMsg(output->scrn->scrnIndex, X_ERROR,
+			"RRChangeOutputProperty error, %d\n", err);
+	    }
+	}
+    }
 }
 
 static void
@@ -99,7 +252,7 @@ output_detect(xf86OutputPtr output)
     drmModeConnectorPtr drm_connector;
     xf86OutputStatus status;
 
-    drm_connector = drmModeGetConnector(ms->fd, priv->drm_connector->connector_id);
+    drm_connector = drmModeGetConnector(ms->fd, xorg_output_get_id(output));
     if (drm_connector) {
 	drmModeFreeConnector(priv->drm_connector);
 	priv->drm_connector = drm_connector;
@@ -181,18 +334,155 @@ output_mode_valid(xf86OutputPtr output, DisplayModePtr pMode)
 }
 
 #ifdef RANDR_12_INTERFACE
+/**
+ * output_set_property - Set the value of a property on an output
+ *
+ * @output: The output we want to set the property on.
+ * @property: Atom representing the property.
+ * @value: Property value.
+ *
+ * Returns FALSE if the value is not within range. TRUE otherwise.
+ */
 static Bool
 output_set_property(xf86OutputPtr output, Atom property, RRPropertyValuePtr value)
 {
+    modesettingPtr ms = modesettingPTR(output->scrn);
+    struct output_private *vmwgfx_output = output->driver_private;
+    int i;
+
+    for (i = 0; i < vmwgfx_output->num_props; i++) {
+	struct output_prop *p = &vmwgfx_output->props[i];
+
+	if (p->atoms[0] != property)
+	    continue;
+
+	if (p->mode_prop->flags & DRM_MODE_PROP_RANGE) {
+	    uint32_t val;
+
+	    if (value->type != XA_INTEGER || value->format != 32 ||
+		    value->size != 1)
+		return FALSE;
+	    val = *(uint32_t *)value->data;
+
+	    drmModeConnectorSetProperty(ms->fd, xorg_output_get_id(output),
+					p->mode_prop->prop_id, (uint64_t)val);
+	    return TRUE;
+	} else if (p->mode_prop->flags & DRM_MODE_PROP_ENUM) {
+	    Atom	atom;
+	    const char	*name;
+	    int		j;
+
+	    if (value->type != XA_ATOM || value->format != 32 || value->size != 1)
+		return FALSE;
+	    memcpy(&atom, value->data, 4);
+	    name = NameForAtom(atom);
+
+	    /* search for matching name string, then set its value down */
+	    for (j = 0; j < p->mode_prop->count_enums; j++) {
+		if (!strcmp(p->mode_prop->enums[j].name, name)) {
+		    drmModeConnectorSetProperty(ms->fd,
+						xorg_output_get_id(output),
+						p->mode_prop->prop_id,
+						p->mode_prop->enums[j].value);
+		    return TRUE;
+		}
+	    }
+	}
+    }
+
     return TRUE;
 }
 #endif /* RANDR_12_INTERFACE */
 
 #ifdef RANDR_13_INTERFACE
+/**
+ * vmwgfx_refresh_connector - Refresh the KMS connector info of an output
+ *
+ * @output: The output on which to refresh info
+ *
+ * Rereads the connector info from DRM. Returns TRUE if successful,
+ * FALSE otherwise.
+ */
+static Bool
+vmwgfx_refresh_connector(xf86OutputPtr output)
+{
+    modesettingPtr ms = modesettingPTR(output->scrn);
+    struct output_private *vmwgfx_output = output->driver_private;
+    drmModeConnectorPtr new_connector;
+    int i;
+
+    if (output->scrn->vtSema) {
+	int id = xorg_output_get_id(output);
+
+	new_connector = drmModeGetConnector(ms->fd, id);
+	if (new_connector) {
+	    drmModeFreeConnector(vmwgfx_output->drm_connector);
+	    vmwgfx_output->drm_connector = drmModeGetConnector(ms->fd, id);
+	} else {
+	    return FALSE;
+	}
+    }
+
+    for (i = 0; i < vmwgfx_output->num_props; i++) {
+	struct output_prop *p = &vmwgfx_output->props[i];
+
+	p->value = vmwgfx_output->drm_connector->prop_values[p->index];
+    }
+
+    return TRUE;
+}
+
+/**
+ * output_get_property - Update the value of an XServer property.
+ *
+ * @output: The output we want to set the property on.
+ * @property: Atom representing the property.
+ *
+ * Returns FALSE if the property is not found. TRUE otherwise.
+ */
 static Bool
 output_get_property(xf86OutputPtr output, Atom property)
 {
-    return TRUE;
+    struct output_private *vmwgfx_output = output->driver_private;
+    uint32_t value;
+    int err, i;
+
+    if (!vmwgfx_refresh_connector(output))
+	return FALSE;
+
+    for (i = 0; i < vmwgfx_output->num_props; i++) {
+	struct output_prop *p = &vmwgfx_output->props[i];
+	if (p->atoms[0] != property)
+	    continue;
+
+	value = vmwgfx_output->drm_connector->prop_values[p->index];
+	p->value = value;
+
+	if (p->mode_prop->flags & DRM_MODE_PROP_RANGE) {
+	    err = RRChangeOutputProperty(output->randr_output,
+					 property, XA_INTEGER, 32,
+					 PropModeReplace, 1, &value,
+					 FALSE, FALSE);
+
+	    return !err;
+	} else if (p->mode_prop->flags & DRM_MODE_PROP_ENUM) {
+	    int j;
+
+	    /* search for matching name string, then set its value down */
+	    for (j = 0; j < p->mode_prop->count_enums; j++) {
+		if (p->mode_prop->enums[j].value == value)
+		    break;
+	    }
+
+	    err = RRChangeOutputProperty(output->randr_output, property,
+					 XA_ATOM, 32, PropModeReplace, 1,
+					 &p->atoms[j+1], FALSE, FALSE);
+
+	    return !err;
+	}
+    }
+
+    return FALSE;
 }
 #endif /* RANDR_13_INTERFACE */
 
@@ -200,6 +490,14 @@ static void
 output_destroy(xf86OutputPtr output)
 {
     struct output_private *priv = output->driver_private;
+    int i;
+
+    for (i = 0; i < priv->num_props; i++) {
+	drmModeFreeProperty(priv->props[i].mode_prop);
+	free(priv->props[i].atoms);
+    }
+    free(priv->props);
+
     drmModeFreeConnector(priv->drm_connector);
     free(priv);
     output->driver_private = NULL;
@@ -300,7 +598,7 @@ xorg_output_init(ScrnInfoPtr pScrn)
     drmModeEncoderPtr drm_encoder = NULL;
     struct output_private *priv;
     char name[32];
-    int c, p;
+    int c;
 
     res = drmModeGetResources(ms->fd);
     if (res == 0) {
@@ -314,32 +612,6 @@ xorg_output_init(ScrnInfoPtr pScrn)
 	drm_connector = drmModeGetConnector(ms->fd, res->connectors[c]);
 	if (!drm_connector)
 	    goto out;
-
-
-	for (p = 0; p < drm_connector->count_props; p++) {
-	    drmModePropertyPtr prop;
-
-	    prop = drmModeGetProperty(ms->fd, drm_connector->props[p]);
-
-	    if (prop) {
-
-#if 0
-	      /*
-	       * Disabled until we sort out what the interface should
-	       * look like.
-	       */
-
-		if (strcmp(prop->name, "implicit placement") == 0) {
-		    drmModeConnectorSetProperty(ms->fd,
-						drm_connector->connector_id,
-						prop->prop_id,
-						0);
-		    is_implicit = FALSE;
-		}
-#endif
-		drmModeFreeProperty(prop);
-	    }
-	}
 
 	if (drm_connector->connector_type >=
 	    sizeof(output_enum_list) / sizeof(output_enum_list[0]))
@@ -371,7 +643,6 @@ xorg_output_init(ScrnInfoPtr pScrn)
 	    output->possible_crtcs = 0;
 	    output->possible_clones = 0;
 	}
-	priv->c = c;
 	priv->drm_connector = drm_connector;
 	output->driver_private = priv;
 	output->subpixel_order = SubPixelHorizontalRGB;
@@ -390,4 +661,92 @@ xorg_output_get_id(xf86OutputPtr output)
     return priv->drm_connector->connector_id;
 }
 
+
+#ifdef HAVE_LIBUDEV
+/**
+ * vmwgfx_handle_uevents - Udev event handler
+ *
+ * @fd: Currently unused.
+ * @closure: Pointer to the screens ScrnInfoRec, typecast to void.
+ *
+ * Handler that is called when the driver receives an udev event.
+ * It refreshes the RandR information.
+ */
+static void
+vmwgfx_handle_uevents(int fd, void *closure)
+{
+    ScrnInfoPtr scrn = closure;
+    modesettingPtr ms = modesettingPTR(scrn);
+    struct udev_device *dev;
+    rrScrPriv(scrn->pScreen);
+
+    dev = udev_monitor_receive_device(ms->uevent_monitor);
+    if (!dev)
+	return;
+
+    RRGetInfo(xf86ScrnToScreen(scrn), TRUE);
+    udev_device_unref(dev);
+
+    pScrPriv->lastSetTime = currentTime;
+    xf86RandR12TellChanged(scrn->pScreen);
+}
+#endif  /* HAVE_LIBUDEV */
+
+/**
+ * vmwgfx_uevent_init - Initialize the udev monitor.
+ *
+ * @scrn: Pointer to the screen's ScrnInfoRec.
+ */
+void vmwgfx_uevent_init(ScrnInfoPtr scrn)
+{
+#ifdef HAVE_LIBUDEV
+    modesettingPtr ms = modesettingPTR(scrn);
+    struct udev *u;
+    struct udev_monitor *mon;
+
+    u = udev_new();
+    if (!u)
+	return;
+    mon = udev_monitor_new_from_netlink(u, "udev");
+    if (!mon) {
+	udev_unref(u);
+	return;
+    }
+
+    if (udev_monitor_filter_add_match_subsystem_devtype(mon,
+							"drm",
+							"drm_minor") < 0 ||
+	udev_monitor_enable_receiving(mon) < 0) {
+	udev_monitor_unref(mon);
+	udev_unref(u);
+	return;
+    }
+
+    ms->uevent_handler = xf86AddGeneralHandler(udev_monitor_get_fd(mon),
+					       vmwgfx_handle_uevents,
+					       scrn);
+
+    ms->uevent_monitor = mon;
+#endif  /* HAVE_LIBUDEV */
+}
+
+/**
+ * vmwgfx_uevent_fini - Take down the udev monitor.
+ *
+ * @scrn: Pointer to the screen's ScrnInfoRec.
+ */
+void vmwgfx_uevent_fini(ScrnInfoPtr scrn)
+{
+#ifdef HAVE_LIBUDEV
+    modesettingPtr ms = modesettingPTR(scrn);
+
+    if (ms->uevent_handler) {
+	struct udev *u = udev_monitor_get_udev(ms->uevent_monitor);
+
+	xf86RemoveGeneralHandler(ms->uevent_handler);
+	udev_monitor_unref(ms->uevent_monitor);
+	udev_unref(u);
+    }
+#endif /* HAVE_LIBUDEV */
+}
 /* vim: set sw=4 ts=8 sts=4: */

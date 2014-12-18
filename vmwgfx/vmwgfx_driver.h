@@ -54,6 +54,10 @@
 #endif
 #endif
 
+#ifdef HAVE_LIBUDEV
+#include <libudev.h>
+#endif
+
 #if GET_ABI_MAJOR(ABI_VIDEODRV_VERSION) < 12
 #define _swapl(x, n) swapl(x,n)
 #define _swaps(x, n) swaps(x,n)
@@ -141,11 +145,16 @@ typedef struct _modesettingRec
     Bool dri2_available;
     char dri2_device_name[VMWGFX_DRI_DEVICE_LEN];
 #endif
+#ifdef HAVE_LIBUDEV
+    struct udev_monitor *uevent_monitor;
+    InputHandlerProc uevent_handler;
+#endif
 } modesettingRec, *modesettingPtr;
 
 #define modesettingPTR(p) ((modesettingPtr)((p)->driverPrivate))
 
 void xorg_flush(ScreenPtr pScreen);
+
 /***********************************************************************
  * xorg_dri2.c
  */
@@ -183,7 +192,10 @@ xorg_output_get_id(xf86OutputPtr output);
 
 Bool
 vmwgfx_output_explicit_overlap(ScrnInfoPtr pScrn);
-
+void
+vmwgfx_uevent_init(ScrnInfoPtr scrn);
+void
+vmwgfx_uevent_fini(ScrnInfoPtr scrn);
 
 /***********************************************************************
  * xorg_xv.c
